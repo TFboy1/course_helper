@@ -88,13 +88,21 @@ class _BaiduMapWidgetState extends State<BaiduMapWidget> {
     _locationPlugin.singleLocationCallback(callback: (BaiduLocation result) {
       if (_isDisposed) return;
 
-      if (result.locType != null && result.locType! > 0) {
-        final coord = BMFCoordinate(result.latitude!, result.longitude!);
+      final latitude = result.latitude;
+      final longitude = result.longitude;
+      // locType 仅 Android 返回，iOS 使用 errorCode 和坐标判定结果。
+      final succeeded = Platform.isIOS
+          ? (result.errorCode == null || result.errorCode == 0)
+          : (result.locType != null && result.locType! > 0);
+      if (succeeded && latitude != null && longitude != null &&
+          latitude.isFinite && longitude.isFinite &&
+          latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180) {
+        final coord = BMFCoordinate(latitude, longitude);
         _handleLocationUpdate(coord, result);
       } else {
         if (mounted) {
           setState(() {
-            _locationInfo = '定位失败，请重试';
+            _locationInfo = result.errorInfo ?? '定位失败，请重试';
             _isLocating = false;
             _isManualRelocate = false;
           });
