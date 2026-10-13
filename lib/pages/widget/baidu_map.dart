@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'package:flutter_baidu_mapapi_map/flutter_baidu_mapapi_map.dart';
 import 'package:flutter_baidu_mapapi_base/flutter_baidu_mapapi_base.dart';
 import 'package:flutter_baidu_mapapi_search/flutter_baidu_mapapi_search.dart';
@@ -27,6 +28,9 @@ class BaiduMapWidget extends StatefulWidget {
 }
 
 class _BaiduMapWidgetState extends State<BaiduMapWidget> {
+  static const _iosApiKey = String.fromEnvironment(
+    'BAIDU_IOS_AK', defaultValue: 'bEu6xF3jXuRZKQwjwrt49iOq',
+  );
   BMFMapController? _mapController;
   BMFCoordinate? _currentPosition;
   BMFCoordinate? _markerPosition;
@@ -51,6 +55,9 @@ class _BaiduMapWidgetState extends State<BaiduMapWidget> {
   void initState() {
     super.initState();
     BMFMapSDK.setAgreePrivacy(true);
+    if (Platform.isIOS) {
+      BMFMapSDK.setApiKeyAndCoordType(_iosApiKey, BMF_COORD_TYPE.BD09LL);
+    }
     _initLocation();
   }
 
@@ -76,6 +83,8 @@ class _BaiduMapWidgetState extends State<BaiduMapWidget> {
   }
 
   Future<void> _initBaiduLocation() async {
+    await _locationPlugin.setAgreePrivacy(true);
+    if (Platform.isIOS) await _locationPlugin.authAK(_iosApiKey);
     _locationPlugin.singleLocationCallback(callback: (BaiduLocation result) {
       if (_isDisposed) return;
 
@@ -203,11 +212,11 @@ class _BaiduMapWidgetState extends State<BaiduMapWidget> {
 
   /// 权限检查（保留 permission_handler 实现，可区分"永久拒绝"）
   Future<bool> _checkPermissions() async {
-    var status = await Permission.location.status;
+    var status = await Permission.locationWhenInUse.status;
 
     if (status.isDenied) {
-      await Permission.location.request();
-      status = await Permission.location.status;
+      await Permission.locationWhenInUse.request();
+      status = await Permission.locationWhenInUse.status;
     }
 
     if (_isDisposed) return false;

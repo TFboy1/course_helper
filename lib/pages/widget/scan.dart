@@ -65,19 +65,19 @@ class _ScanPageState extends State<ScanPage>
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
+  void didChangeAppLifecycleState(AppLifecycleState state) async {
     final controller = _controller;
-    if (controller == null) return;
+    if (controller == null || _isInitializing || _handled || !controller.value.hasCameraPermission) return;
 
     try {
       switch (state) {
         case AppLifecycleState.resumed:
-          controller.start();
+          await controller.start();
         case AppLifecycleState.inactive:
         case AppLifecycleState.paused:
         case AppLifecycleState.detached:
         case AppLifecycleState.hidden:
-          controller.stop();
+          await controller.stop();
       }
     } catch (e) {
       logger.e('Lifecycle handling error: $e');
@@ -216,12 +216,12 @@ class _ScanPageState extends State<ScanPage>
     final code = capture.barcodes.first.rawValue;
     if (code == null) return;
 
-    _handled = true;
     _handleScanResult(code);
   }
 
   void _handleScanResult(String data) async {
-    if (!mounted) return;
+    if (!mounted || _handled) return;
+    _handled = true;
 
     stop();
 

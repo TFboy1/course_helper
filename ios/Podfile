@@ -11,11 +11,15 @@ project 'Runner', {
 }
 
 def flutter_root
-  generated_xcconfig = parse_KV_file('./Flutter/Generated.xcconfig')
-  if generated_xcconfig.empty?
-    puts "Generated.xcconfig must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+  generated_xcconfig = File.expand_path(File.join('Flutter', 'Generated.xcconfig'), __dir__)
+  unless File.exist?(generated_xcconfig)
+    raise "#{generated_xcconfig} must exist. Run flutter pub get before pod install"
   end
-  generated_xcconfig['FLUTTER_ROOT']
+  File.foreach(generated_xcconfig) do |line|
+    match = line.match(/FLUTTER_ROOT\=(.*)/)
+    return match[1].strip if match
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcconfig}. Run flutter pub get"
 end
 
 require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
@@ -32,5 +36,15 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+    target.build_configurations.each do |config|
+      config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] = Array(config.build_settings['GCC_PREPROCESSOR_DEFINITIONS']) | [
+        '$(inherited)',
+        'PERMISSION_CAMERA=1',
+        'PERMISSION_PHOTOS=1',
+        'PERMISSION_PHOTOS_ADD_ONLY=1',
+        'PERMISSION_LOCATION_WHENINUSE=1',
+        'PERMISSION_NOTIFICATIONS=1',
+      ]
+    end
   end
 end

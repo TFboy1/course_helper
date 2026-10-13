@@ -169,7 +169,14 @@ class EasemobIM {
         priority: Priority.high
       );
 
-      final notificationDetails = NotificationDetails(android: androidDetails);
+      final notificationDetails = NotificationDetails(
+        android: androidDetails,
+        iOS: const DarwinNotificationDetails(
+          presentAlert: true,
+          presentBadge: true,
+          presentSound: true,
+        ),
+      );
 
       final int notificationId = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       

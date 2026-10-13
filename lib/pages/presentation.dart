@@ -5,7 +5,7 @@ import 'package:photo_manager/photo_manager.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show WebSocket, File;
+import 'dart:io' show WebSocket, File, Platform;
 
 import '../api/course.dart';
 import '../api/image.dart';
@@ -45,8 +45,9 @@ class PresentationPage extends StatefulWidget {
   State<PresentationPage> createState() => _PresentationPageState();
 }
 
-class _PresentationPageState extends State<PresentationPage> {
+class _PresentationPageState extends State<PresentationPage> with WidgetsBindingObserver {
   WebSocket? _ws;
+  bool _connecting = false;
   final ScrollController _scrollController = ScrollController();
   final PageController _pageController = PageController();
 
@@ -86,14 +87,16 @@ class _PresentationPageState extends State<PresentationPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initialize();
     _startForegroundService();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     // 发送离开课堂消息
-    if (_ws != null) {
+    if (_ws?.readyState == WebSocket.open) {
       final leaveData = {
         "op": "leavelesson",
         "lessonid": widget.lessonId
@@ -111,7 +114,18 @@ class _PresentationPageState extends State<PresentationPage> {
 
   Future<void> _initialize() async {
     await _checkToken();
-    _connectWebSocket();
+    if (mounted && RCCourseApi().lessonToken != null) await _connectWebSocket();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!Platform.isIOS) return;
+    if (state == AppLifecycleState.resumed) {
+      if (RCCourseApi().lessonToken != null) _connectWebSocket();
+    } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached || state == AppLifecycleState.hidden) {
+      _ws?.close();
+      _ws = null;
+    }
   }
 
   Future<void> _checkToken() async {
@@ -164,6 +178,7 @@ class _PresentationPageState extends State<PresentationPage> {
   }
 
   Future<void> _startForegroundService() async {
+    if (!Platform.isAndroid) return;
     // 请求忽略电池优化
     if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
       await FlutterForegroundTask.requestIgnoreBatteryOptimization();
@@ -198,19 +213,25 @@ class _PresentationPageState extends State<PresentationPage> {
   }
 
   Future<void> _stopForegroundService() async {
+    if (!Platform.isAndroid) return;
     if (await FlutterForegroundTask.isRunningService) {
       await FlutterForegroundTask.stopService();
     }
   }
 
   Future<void> _connectWebSocket() async {
+    if (!mounted || _connecting) return;
+    _connecting = true;
     try {
+      await _ws?.close();
+      _ws = null;
       late String lessonUrl;
       final currentServerName = PlatformManager().currentServer.name;
       lessonUrl = currentServerName == 'yuketang'?
       'wss://www.yuketang.cn/wsapp/' : 'wss://$currentServerName.yuketang.cn/wsapp/';
 
       final ws = await WebSocket.connect(lessonUrl);
+      if (!mounted) { await ws.close(); return; }
       _ws = ws;
 
       final helloData = {
@@ -227,9 +248,13 @@ class _PresentationPageState extends State<PresentationPage> {
         (message) {
           _handleMessage(message);
         },
+        onError: (Object error) => logger.e('WebSocket 错误', error: error),
+        onDone: () { if (identical(_ws, ws)) _ws = null; },
       );
     } catch (e) {
       logger.e('WebSocket 连接失败：$e');
+    } finally {
+      _connecting = false;
     }
   }
 

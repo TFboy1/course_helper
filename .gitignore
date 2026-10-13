@@ -43,3 +43,22 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Web / Python service
+/backend/.venv/
+/backend/.env
+/backend/data/
+/backend/backups/
+**/__pycache__/
+/web/node_modules/
+/web/dist/
+/web/*.tsbuildinfo
+
+# iOS signing material and personal Xcode state
+*.p12
+*.pfx
+*.p8
+*.mobileprovision
+*.ipa
+**/xcuserdata/
+*.xcuserstate

@@ -1,0 +1,54 @@
+name: Flutter iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/ios-webclient]
+    paths:
+      - 'lib/**'
+      - 'ios/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - '.github/workflows/ios-flutter.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.8'
+          channel: stable
+          cache: true
+      - name: Install locked dependencies
+        run: flutter pub get --enforce-lockfile
+      - name: Build iPhone release
+        env:
+          BAIDU_IOS_AK: ${{ secrets.BAIDU_IOS_AK }}
+        run: |
+          args=(--release --no-codesign --build-number="$GITHUB_RUN_NUMBER")
+          if [[ -n "$BAIDU_IOS_AK" ]]; then args+=(--dart-define="BAIDU_IOS_AK=$BAIDU_IOS_AK"); fi
+          flutter build ios "${args[@]}"
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          mkdir -p build/ios/package/Payload
+          ditto build/ios/iphoneos/Runner.app build/ios/package/Payload/Runner.app
+          ditto -c -k --keepParent build/ios/package/Payload build/ios/CourseHelper-ios-unsigned.ipa
+          printf '%s\n' '这是待签名 IPA，不能直接安装。请使用自己的 Apple ID 或有效证书完成签名。' > build/ios/INSTALL.txt
+          shasum -a 256 build/ios/CourseHelper-ios-unsigned.ipa > build/ios/SHA256.txt
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: course-helper-ios-unsigned
+          path: |
+            build/ios/CourseHelper-ios-unsigned.ipa
+            build/ios/INSTALL.txt
+            build/ios/SHA256.txt
+          if-no-files-found: error
+          retention-days: 14
