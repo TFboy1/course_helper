@@ -1,0 +1,7 @@
+# 把域名替换成你自己的；将域名 DNS 指向运行该服务的服务器。
+courses.example.com {
+    reverse_proxy 127.0.0.1:8000 {
+        # 及时发送 SSE，避免代理缓冲结果。
+        flush_interval -1
+    }
+}

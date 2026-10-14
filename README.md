@@ -1,5 +1,16 @@
 # 课程助手
 一个管理学习通、雨课堂课程的应用。
+
+## 网页版
+
+新增 Vue 3 + FastAPI 网页版本：凭加入码访问，通过两平台官方 App 扫码登录，自行授权后由一位成员扫码完成批量签到。支持实时逐人结果、网页滑块补验和登录态持久化。启动、HTTPS 部署与备份详见 [网页说明](backend/README.md)。
+
+## iOS 安装包
+
+现有 Flutter 移动客户端已完成 iOS 适配，GitHub macOS 构建通过，支持 iOS 13 及以上。Actions 可下载待签名 IPA，安装前需使用自己的 Apple ID 或有效证书签名。构建与安装步骤见 [iOS 说明](ios/README.md)。
+
+## 移动客户端
+
 |账号管理|课程列表|课程设置|签到功能|
 |---|---|---|---|
 | ![账号管理](images/screenshot/accounts.jpg) | ![课程列表](images/screenshot/courses.jpg) | ![课程设置](images/screenshot/course_setting.jpg) | ![签到功能](images/screenshot/sign_in.jpg) |
@@ -27,7 +38,7 @@
 | 平台        | 状态    | 说明                       |
 |-----------|-------|--------------------------|
 | Android   | 可用    | 在 Release 中获取安装包         |
-| iOS       | 需自行构建 | 缺少证书，需自行配置后构建            |
+| iOS       | 待签名 IPA | GitHub Actions 构建，个人签名后安装 |
 | Windows   | 需自行构建 | 部分功能（如扫描二维码）暂不可用         |
 | HarmonyOS | 需自行构建 | 可使用 HarmonyFlutterSDK 构建 |
 

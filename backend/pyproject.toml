@@ -1,0 +1,14 @@
+[project]
+name = "course-helper-web"
+version = "0.1.0"
+description = "课程助手网页服务：双平台二维码登录与授权批量签到"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "cryptography>=44",
+    "uvicorn>=0.34,<1",
+]
+
+[tool.uv]
+package = false
