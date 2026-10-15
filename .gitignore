@@ -53,6 +53,7 @@ app.*.map.json
 /web/node_modules/
 /web/dist/
 /web/*.tsbuildinfo
+/public/
 
 # iOS signing material and personal Xcode state
 *.p12

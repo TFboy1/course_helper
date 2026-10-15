@@ -1,10 +1,12 @@
 from collections import defaultdict, deque
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, nullcontext
 import hmac
 import logging
 from pathlib import Path
 import time
 from typing import Literal
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
@@ -26,10 +28,6 @@ class AccessInput(BaseModel):
 class LoginInput(BaseModel):
     platform: Literal["chaoxing", "rainClassroom"]
     server: Literal["yuketang", "pro", "changjiang", "huanghe"] | None = None
-
-
-class AuthorizationInput(BaseModel):
-    enabled: bool
 
 
 class SignInput(BaseModel):
@@ -92,15 +90,32 @@ def create_app(settings: Settings | None = None, client_factory=PlatformClient):
         config = settings or Settings.from_env()
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
-        with database_lock(config.database):
+        lock = database_lock(config.database) if isinstance(config.database, Path) else nullcontext()
+        with lock:
             store = Store(config.database, config.credential_key)
-            store.recover()
+            store.seed_access_code(config.join_code)
+            if not config.serverless:
+                store.prune_expired_jobs()
+                store.recover()
             service = Service(config, store, client_factory)
             app.state.settings, app.state.store, app.state.service = config, store, service
+
+            cleanup_task = None
+            if not config.serverless:
+                async def prune_expired_jobs():
+                    while True:
+                        await asyncio.sleep(60)
+                        store.prune_expired_jobs()
+
+                cleanup_task = asyncio.create_task(prune_expired_jobs(), name="prune-expired-jobs")
             try:
                 yield
             finally:
+                if cleanup_task:
+                    cleanup_task.cancel()
+                    await asyncio.gather(cleanup_task, return_exceptions=True)
                 await service.close()
+                store.close()
 
     app = FastAPI(title="课程助手网页 API", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(RequestProtection)
@@ -124,17 +139,47 @@ def create_app(settings: Settings | None = None, client_factory=PlatformClient):
 
     def check_origin(request: Request):
         config = request.app.state.settings
-        origins = {config.public_origin}
-        if not config.secure_cookie:
-            origins |= {"http://localhost:5173", "http://127.0.0.1:5173"}
         origin = request.headers.get("origin")
-        if (origin and origin not in origins) or request.headers.get("sec-fetch-site") == "cross-site":
+        if not origin:
+            if request.headers.get("sec-fetch-site") == "cross-site":
+                raise ServiceError(403, "请求来源不受支持")
+            return
+
+        def normalized(value: str):
+            try:
+                parsed = urlsplit(value)
+                if (
+                    parsed.scheme not in {"http", "https"}
+                    or not parsed.hostname
+                    or parsed.path not in {"", "/"}
+                    or parsed.query
+                    or parsed.fragment
+                    or parsed.username is not None
+                    or parsed.password is not None
+                ):
+                    return None
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            except ValueError:
+                return None
+            return parsed.scheme, parsed.hostname.rstrip(".").lower(), port
+
+        request_origin = normalized(f"{request.url.scheme}://{request.url.netloc}")
+        supplied_origin = normalized(origin)
+        trusted = {normalized(config.public_origin), request_origin}
+        trusted.discard(None)
+        local_hosts = {"localhost", "127.0.0.1", "::1"}
+        if not config.serverless and not config.secure_cookie and supplied_origin and supplied_origin[0] == "http" and supplied_origin[1] in local_hosts:
+            trusted.add(supplied_origin)
+
+        if supplied_origin not in trusted or request.headers.get("sec-fetch-site") == "cross-site":
             raise ServiceError(403, "请求来源不受支持")
 
     def session(request: Request):
-        row = request.app.state.store.session(request.cookies.get("course_session"))
+        session_token = request.cookies.get("course_session")
+        row = request.app.state.store.session(session_token)
         if not row:
-            raise ServiceError(401, "请先输入加入码进入网站")
+            message = "网站会话已过期，请重新输入加入码。" if session_token else "请先输入加入码进入网站"
+            raise ServiceError(401, message)
         if request.method not in {"GET", "HEAD"}:
             check_origin(request)
             if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), row["csrf"]):
@@ -142,8 +187,13 @@ def create_app(settings: Settings | None = None, client_factory=PlatformClient):
         return row
 
     def owner(account_id: UUID, request: Request, who=Depends(session)):
-        if not request.app.state.store.owns(who["id"], str(account_id)):
+        if who.get("role") != "admin" and not request.app.state.store.owns(who["id"], str(account_id)):
             raise ServiceError(403, "只能管理自己已验证的账号")
+        return who
+
+    def admin(request: Request, who=Depends(session)):
+        if who.get("role") != "admin":
+            raise ServiceError(403, "仅管理员可以管理房间邀请码")
         return who
 
     @app.get("/api/health")
@@ -160,12 +210,18 @@ def create_app(settings: Settings | None = None, client_factory=PlatformClient):
             attempts.popleft()
         if len(attempts) >= 5:
             raise ServiceError(429, "加入码错误次数较多，请五分钟后再试")
-        config = request.app.state.settings
-        if not hmac.compare_digest(body.join_code.encode("utf-8"), config.join_code.encode("utf-8")):
-            attempts.append(now)
-            raise ServiceError(403, "加入码不正确")
-        # 新会话不继承浏览器提供的旧 session ID，避免会话固定。
-        token, csrf = request.app.state.store.new_session(config.session_days)
+        config, store = request.app.state.settings, request.app.state.store
+        entered_code = body.join_code.strip()
+        is_admin = bool(config.admin_code) and hmac.compare_digest(entered_code.encode("utf-8"), config.admin_code.encode("utf-8"))
+        if is_admin:
+            # 新会话不继承浏览器提供的旧 session ID，避免会话固定。
+            token, csrf = store.new_session(config.session_days, "admin")
+        else:
+            member_session = store.redeem_access_code(entered_code, config.session_days)
+            if not member_session:
+                attempts.append(now)
+                raise ServiceError(403, "CDK 无效或已作废")
+            token, csrf = member_session
         response = JSONResponse({"csrf_token": csrf})
         response.set_cookie("course_session", token, max_age=config.session_days * 86400, httponly=True, secure=config.secure_cookie, samesite="strict", path="/")
         return response
@@ -177,13 +233,27 @@ def create_app(settings: Settings | None = None, client_factory=PlatformClient):
             await service.cancel_login(login_id, who["id"])
         request.app.state.store.delete_session(who["id"])
         await service.changed("me")
-        response = JSONResponse({"message": "已退出网站，已授予的批量签到授权保留，可重新登录账号后撤销"})
+        response = JSONResponse({"message": "已退出网站，账号登录态保留并继续参与共享签到"})
         response.delete_cookie("course_session", path="/", secure=request.app.state.settings.secure_cookie, httponly=True, samesite="strict")
         return response
 
     @app.get("/api/me")
     async def me(request: Request, who=Depends(session)):
         return request.app.state.service.me_snapshot(who["id"])
+
+    @app.post("/api/admin/access-codes")
+    async def create_access_code(request: Request, who=Depends(admin)):
+        code = request.app.state.store.create_access_code(who["id"])
+        await request.app.state.service.changed("me")
+        return code
+
+    @app.delete("/api/admin/access-codes/{code_id}")
+    async def revoke_access_code(code_id: UUID, request: Request, who=Depends(admin)):
+        result = request.app.state.store.revoke_access_code(str(code_id))
+        if result == "missing":
+            raise ServiceError(404, "邀请码不存在")
+        await request.app.state.service.changed("me")
+        return {"message": "CDK 已作废"}
 
     @app.get("/api/me/events")
     async def me_events(request: Request, who=Depends(session)):
@@ -198,7 +268,10 @@ def create_app(settings: Settings | None = None, client_factory=PlatformClient):
 
     @app.get("/api/logins/{login_id}")
     async def login_state(login_id: UUID, request: Request, who=Depends(session)):
-        return request.app.state.service.login_snapshot(str(login_id), who["id"])
+        service = request.app.state.service
+        if request.app.state.settings.serverless:
+            return await service.refresh_login(str(login_id), who["id"])
+        return service.login_snapshot(str(login_id), who["id"])
 
     @app.delete("/api/logins/{login_id}")
     async def cancel_login(login_id: UUID, request: Request, who=Depends(session)):
@@ -214,27 +287,19 @@ def create_app(settings: Settings | None = None, client_factory=PlatformClient):
         service.login_snapshot(str(login_id), who["id"])
         return event_response(service, "login", login_id, who)
 
-    @app.patch("/api/accounts/{account_id}/authorization")
-    async def authorize(account_id: UUID, body: AuthorizationInput, request: Request, who=Depends(owner)):
-        store, service = request.app.state.store, request.app.state.service
-        if body.enabled:
-            account = store.account(str(account_id))
-            if not account["valid"]:
-                raise ServiceError(409, "请重新登录此账号后开启授权")
-            store.authorize(str(account_id), True)
-            await service.changed("me")
-        else:
-            await service.revoke(str(account_id))
-        return {"enabled": body.enabled}
-
     @app.delete("/api/accounts/{account_id}")
     async def unbind(account_id: UUID, request: Request, who=Depends(owner)):
-        await request.app.state.service.revoke(str(account_id), delete=True)
-        return {"message": "已撤销授权并删除保存的登录态"}
+        await request.app.state.service.unbind(str(account_id))
+        return {"message": "已解绑账号并删除保存的登录态"}
 
     @app.post("/api/sign-jobs")
     async def create_job(body: SignInput, request: Request, who=Depends(session)):
-        return request.app.state.service.create_job(who["id"], str(body.request_id), body.qr_text)
+        service = request.app.state.service
+        job = service.create_job(who["id"], str(body.request_id), body.qr_text)
+        if request.app.state.settings.serverless and job["status"] == "running":
+            await service.run_job_inline(job["id"])
+            return service.job_snapshot(job["id"], who["id"])
+        return job
 
     @app.get("/api/sign-jobs/{job_id}")
     async def job(job_id: UUID, request: Request, who=Depends(session)):

@@ -6,8 +6,23 @@ export interface Account {
   platform: Platform
   server: Server | ''
   name: string
-  authorized: number
   valid: number
+}
+
+export interface GroupAccount {
+  id: string
+  platform: Platform
+  server: Server | ''
+  name: string
+  active: boolean | number
+}
+
+export interface AccessCode {
+  id: string
+  code_hint: string
+  status: 'available' | 'used' | 'legacy' | 'revoked'
+  created_at: number
+  used_at: number | null
 }
 
 export interface Login {
@@ -28,6 +43,14 @@ export interface Result {
   status: string
   message: string
   updated: number
+  can_act: boolean
+}
+
+export interface JobSummary {
+  total: number
+  succeeded: number
+  pending: number
+  needs_action: number
 }
 
 export interface Job {
@@ -37,13 +60,18 @@ export interface Job {
   status: 'running' | 'needs_action' | 'done'
   created_at: number
   is_initiator: boolean
+  summary: JobSummary
   results: Result[]
 }
 
 export interface Me {
   csrf_token: string
+  role: 'member' | 'admin'
   accounts: Account[]
   pool: { platform: Platform; server: Server | ''; count: number }[]
+  logged_in_count: number
+  group_accounts?: GroupAccount[]
+  access_codes?: AccessCode[]
   jobs: Job[]
   logins: Login[]
 }
@@ -87,10 +115,33 @@ export async function api<T>(path: string, method = 'GET', body?: unknown): Prom
   return data as T
 }
 
-export function subscribe<T>(path: string, snapshot: (data: T) => void, expired: () => void, interrupted: () => void) {
-  const source = new EventSource(`/api${path}`)
-  source.addEventListener('snapshot', (event) => snapshot(JSON.parse((event as MessageEvent).data) as T))
-  source.addEventListener('auth_expired', () => { source.close(); expired() })
-  source.onerror = interrupted
-  return source
+export interface Subscription { close(): void }
+
+export function subscribe<T>(path: string, snapshot: (data: T) => void, expired: () => void, interrupted: () => void): Subscription {
+  const resource = path.replace(/\/events$/, '')
+  const interval = resource.startsWith('/logins/') ? 2500 : 15000
+  let active = true
+  let timer = 0
+
+  const poll = async () => {
+    try {
+      const data = await api<T>(resource)
+      snapshot(data)
+      if (resource.startsWith('/logins/') && (data as Login).status !== 'waiting') {
+        active = false
+        return
+      }
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        active = false
+        expired()
+        return
+      }
+      interrupted()
+    }
+    if (active) timer = window.setTimeout(poll, interval)
+  }
+
+  void poll()
+  return { close() { active = false; window.clearTimeout(timer) } }
 }

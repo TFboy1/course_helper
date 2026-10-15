@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import type { BrowserQRCodeReader, IScannerControls } from '@zxing/browser'
 import CaptchaPanel from './CaptchaPanel.vue'
 import { api, ApiError, setCsrf, subscribe } from './api'
-import type { Account, Challenge, Job, Login, Me, Platform, Result, Server } from './api'
+import type { AccessCode, Account, Challenge, Job, Login, Me, Platform, Result, Server, Subscription } from './api'
 
 const serverNames: Record<Server, string> = { yuketang: '雨课堂', pro: '荷塘雨课堂', changjiang: '长江雨课堂', huanghe: '黄河雨课堂' }
 const statusNames: Record<string, string> = {
@@ -15,7 +15,9 @@ const me = ref<Me | null>(null)
 const loading = ref(true)
 const busy = ref('')
 const joinCode = ref('')
-const platform = ref<Platform>('chaoxing')
+const newAccessCode = ref('')
+const issuedCodeId = ref('')
+const platform = ref<Platform>('rainClassroom')
 const server = ref<Server>('yuketang')
 const notice = ref<{ text: string; error: boolean } | null>(null)
 const pendingAccounts = ref(new Set<string>())
@@ -34,16 +36,17 @@ const captchaDialog = ref<HTMLDialogElement | null>(null)
 const challenge = ref<Challenge | null>(null)
 const captchaTarget = ref<Result | null>(null)
 const captchaBusy = ref(false)
-let loginSource: EventSource | null = null
-let meSource: EventSource | null = null
+let loginSource: Subscription | null = null
+let meSource: Subscription | null = null
 let cameraControls: IScannerControls | null = null
 let cameraGeneration = 0
 let submission: { input: string; id: string } | null = null
 
 const currentPool = computed(() => me.value?.pool.find(p => p.platform === platform.value && p.server === (platform.value === 'rainClassroom' ? server.value : ''))?.count ?? 0)
-const successCount = computed(() => currentJob.value?.results.filter(r => ['success', 'already_signed'].includes(r.status)).length ?? 0)
-const actionCount = computed(() => currentJob.value?.results.filter(r => r.status.startsWith('needs_')).length ?? 0)
-const progress = computed(() => !currentJob.value ? 0 : Math.round(currentJob.value.results.filter(r => !['pending', 'running'].includes(r.status)).length / currentJob.value.results.length * 100))
+const availableCodeCount = computed(() => me.value?.access_codes?.filter(code => code.status === 'available').length ?? 0)
+const successCount = computed(() => currentJob.value?.summary.succeeded ?? 0)
+const actionCount = computed(() => currentJob.value?.summary.needs_action ?? 0)
+const progress = computed(() => !currentJob.value || !currentJob.value.summary.total ? 0 : Math.round((currentJob.value.summary.total - currentJob.value.summary.pending) / currentJob.value.summary.total * 100))
 
 function label(p: Platform, s: Server | '') { return p === 'chaoxing' ? '学习通' : serverNames[s as Server] ?? '雨课堂' }
 function timeLabel(timestamp: number) { return new Date(timestamp * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) }
@@ -51,7 +54,7 @@ function flash(text: string, error = false) { notice.value = { text, error } }
 function clearSession() {
   loginSource?.close(); meSource?.close(); meSource = null; stopCamera()
   loginDialog.value?.close(); captchaDialog.value?.close()
-  activeLogin.value = null; currentJob.value = null; me.value = null; setCsrf('')
+  activeLogin.value = null; currentJob.value = null; me.value = null; newAccessCode.value = ''; issuedCodeId.value = ''; setCsrf('')
 }
 function handleError(error: unknown) {
   if (error instanceof ApiError && error.status === 401) clearSession()
@@ -90,6 +93,33 @@ async function refreshMe() {
   })
 }
 
+async function createAccessCode() {
+  busy.value = 'code'
+  try {
+    const created = await api<{ id: string; code: string }>('/admin/access-codes', 'POST', {})
+    newAccessCode.value = created.code; issuedCodeId.value = created.id
+    await refreshMe()
+    flash('CDK 已生成，请立即复制并发给对应成员。')
+  } catch (error) { handleError(error) }
+  finally { busy.value = '' }
+}
+
+async function copyAccessCode() {
+  try { await navigator.clipboard.writeText(newAccessCode.value); flash('CDK 已复制。') }
+  catch { flash('自动复制失败，请手动选择 CDK 复制。', true) }
+}
+
+async function revokeAccessCode(code: AccessCode) {
+  if (!window.confirm(`作废 ${code.code_hint}？作废后将无法再次登录，现有网站会话也会失效。`)) return
+  busy.value = `revoke:${code.id}`
+  try {
+    await api(`/admin/access-codes/${code.id}`, 'DELETE')
+    if (issuedCodeId.value === code.id) { newAccessCode.value = ''; issuedCodeId.value = '' }
+    await refreshMe(); flash('CDK 已作废。')
+  } catch (error) { handleError(error) }
+  finally { busy.value = '' }
+}
+
 async function enter() {
   busy.value = 'access'
   try {
@@ -118,7 +148,7 @@ async function openLogin(login: Login) {
     if (data.status !== 'waiting') { loginSource?.close(); loginSource = null }
     if (data.status === 'success') {
       loginDialog.value?.close(); activeLogin.value = null
-      flash('登录成功。开启账号授权后，就能参与批量签到。')
+      flash('登录成功，账号已加入共享签到池。')
       try { await refreshMe() } catch (error) { handleError(error) }
     }
   }, () => { clearSession(); flash('网站会话已过期，请重新进入。', true) }, () => {
@@ -144,27 +174,17 @@ async function closeLogin() {
   }
 }
 
-async function toggleAuthorization(account: Account, event: Event) {
-  const input = event.target as HTMLInputElement
+async function unbind(account: Pick<Account, 'id' | 'name'>) {
+  if (!window.confirm(`解绑 ${account.name} 会删除保存的登录态，并停止后续共享签到；重新使用需要扫码登录。确认解绑？`)) return
   pendingAccounts.value.add(account.id)
-  try {
-    await api(`/accounts/${account.id}/authorization`, 'PATCH', { enabled: input.checked })
-    await refreshMe(); flash(input.checked ? `${account.name} 已加入共享授权池。` : `${account.name} 已停止参与新的批量签到。`)
-  } catch (error) { input.checked = Boolean(account.authorized); handleError(error) }
-  finally { pendingAccounts.value.delete(account.id) }
-}
-
-async function unbind(account: Account) {
-  if (!window.confirm(`解绑 ${account.name} 会撤销授权并删除保存的登录态，重新使用需要扫码登录。确认解绑？`)) return
-  pendingAccounts.value.add(account.id)
-  try { await api(`/accounts/${account.id}`, 'DELETE'); await refreshMe(); flash('账号已解绑，授权已撤销。') }
+  try { await api(`/accounts/${account.id}`, 'DELETE'); await refreshMe(); flash('账号已解绑并停止参与共享签到。') }
   catch (error) { handleError(error) }
   finally { pendingAccounts.value.delete(account.id) }
 }
 
 async function logout() {
-  if (!window.confirm('退出网站后，已授权账号仍可参与签到。若希望停止，请先关闭账号授权。现在退出网站？')) return
-  try { await api('/access', 'DELETE'); clearSession(); flash('已退出网站，已授予的签到授权保留。') }
+  if (!window.confirm('退出网站后，账号登录态会保留，并继续参与其他成员发起的签到。确认退出？')) return
+  try { await api('/access', 'DELETE'); clearSession(); flash('已退出网站，账号仍会参与共享签到。') }
   catch (error) { handleError(error) }
 }
 
@@ -263,7 +283,11 @@ onMounted(async () => {
     await refreshMe()
     if (me.value?.accounts[0]) { platform.value = me.value.accounts[0].platform; if (me.value.accounts[0].server) server.value = me.value.accounts[0].server }
     if (me.value?.logins[0]) await openLogin(me.value.logins[0])
-  } catch (error) { if (!(error instanceof ApiError && error.status === 401)) handleError(error) }
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) {
+      if (error.message.includes('已过期')) flash(error.message, true)
+    } else handleError(error)
+  }
   finally { loading.value = false }
   document.addEventListener('visibilitychange', visibleAgain)
 })
@@ -285,38 +309,54 @@ onUnmounted(() => { loginSource?.close(); meSource?.close(); stopCamera(); docum
       <section class="welcome-copy">
         <p class="eyebrow">少一步操作，多一份从容</p>
         <h1>有人扫码，<br />大家一起完成。</h1>
-        <p class="welcome-description">登录自己的学习平台账号，开启授权。下一次签到，交给正在扫码的那位同学。</p>
-        <div class="welcome-steps"><span><b>01</b> 进入</span><span><b>02</b> 登录与授权</span><span><b>03</b> 共享签到</span></div>
+        <p class="welcome-description">登录自己的学习平台账号，之后由正在扫码的同学发起共享签到。</p>
+        <div class="welcome-steps"><span><b>01</b> 进入</span><span><b>02</b> 扫码登录</span><span><b>03</b> 共享签到</span></div>
       </section>
       <section class="entry-card">
         <div class="section-number" aria-hidden="true">01 / 进入工作台</div>
-        <h2>从一个加入码开始</h2><p class="muted">向邀请你的人获取加入码。</p>
+        <h2>从一个 CDK 开始</h2><p class="muted">成员使用管理员发放的 CDK，可反复登录网站；每枚 CDK 只能绑定一个雨课堂账号。管理员使用专属管理员码。</p>
         <form @submit.prevent="enter"><label for="join-code">加入码</label><input id="join-code" v-model="joinCode" type="password" maxlength="256" autocomplete="off" placeholder="输入加入码" required /><button class="button primary full" type="submit" :disabled="!!busy">{{ busy === 'access' ? '正在进入…' : '进入工作台 →' }}</button></form>
-        <p class="fine-print">无需另注册网站账号。进入后，用学习通或雨课堂官方 App 扫码登录。</p>
+        <p class="fine-print">成员可看全组进度和自己的账号明细；姓名仅管理员可见。无需另注册网站账号。</p>
       </section>
     </main>
 
     <main v-else class="workspace">
-      <section class="workspace-intro"><div><p class="eyebrow">你的小组，今天也在一起</p><h1>把签到交给一次扫码。</h1></div><div class="pool-summary"><b>{{ currentPool.toString().padStart(2, '0') }}</b><span>{{ label(platform, platform === 'chaoxing' ? '' : server) }}<br />有效授权账号</span></div></section>
+      <section class="workspace-intro"><div><p class="eyebrow">{{ me.role === 'admin' ? '管理员工作台' : '你的小组，今天也在一起' }}</p><h1>把签到交给一次扫码。</h1><p class="fine-print">{{ me.role === 'admin' ? '管理员可查看全组姓名、管理成员 CDK。' : '下方显示全组有效登录账号数量和你自己的账号明细；成员之间看不到彼此姓名。' }}</p></div><div class="pool-summary"><b>{{ me.logged_in_count.toString().padStart(2, '0') }}</b><span>全组有效登录<br />账号</span><small>当前选择：{{ currentPool }} 个{{ label(platform, platform === 'chaoxing' ? '' : server) }}</small></div></section>
+      <div v-if="me.role === 'admin'" class="admin-grid">
+        <section class="panel admin-panel">
+          <div class="panel-heading"><div><p class="section-number">管理 / 房间访问</p><h2>成员 CDK</h2></div><span class="small-count">{{ availableCodeCount }} 个可用</span></div>
+          <p class="muted">每位成员使用一枚可重复登录的 CDK，且每枚只能绑定一个雨课堂账号。明文只在生成时显示，请立即发给对应成员；遗失时可作废并重发。</p>
+          <button class="button secondary" type="button" :disabled="!!busy" @click="createAccessCode">{{ busy === 'code' ? '正在生成…' : '生成成员 CDK' }}</button>
+          <div v-if="newAccessCode" class="issued-code" role="status"><code>{{ newAccessCode }}</code><button class="button ghost" type="button" @click="copyAccessCode">复制</button></div>
+          <ul v-if="me.access_codes?.length" class="access-code-list"><li v-for="code in me.access_codes" :key="code.id"><div class="access-code-info"><code>{{ code.code_hint }}</code><span :class="['badge', code.status === 'available' ? 'valid' : 'warning']">{{ code.status === 'available' ? '可重复登录' : code.status === 'legacy' ? '一次性旧邀请码' : code.status === 'used' ? '旧邀请码已兑换' : '已作废' }}</span><small>生成于 {{ timeLabel(code.created_at) }}<template v-if="code.used_at"> · 首次登录于 {{ timeLabel(code.used_at) }}</template></small></div><button v-if="code.status === 'available' || code.status === 'legacy'" class="text-button danger" type="button" :disabled="!!busy" @click="revokeAccessCode(code)">作废</button></li></ul>
+          <p v-else class="empty-note">还没有 CDK，点击上方按钮生成。</p>
+        </section>
+        <section class="panel admin-panel">
+          <div class="panel-heading"><div><p class="section-number">全组 / 登录情况</p><h2>全组账号</h2></div><span class="small-count">{{ me.logged_in_count }} 个有效</span></div>
+          <p class="muted">成员只会看到账号数量；姓名和平台信息仅管理员可见。</p>
+          <ul v-if="me.group_accounts?.length" class="group-account-list"><li v-for="account in me.group_accounts" :key="account.id"><span class="avatar" aria-hidden="true">{{ account.name.slice(0, 1) }}</span><div class="account-name"><b>{{ account.name }}</b><span>{{ label(account.platform, account.server) }}</span></div><span :class="['badge', account.active ? 'valid' : 'warning']">{{ account.active ? '已登录' : '需重新登录' }}</span><button class="text-button danger" type="button" :disabled="pendingAccounts.has(account.id)" @click="unbind(account)">解绑</button></li></ul>
+          <p v-else class="empty-note">还没有登记过的账号。</p>
+        </section>
+      </div>
       <div class="workspace-grid">
         <section class="panel account-panel">
-          <div class="panel-heading"><div><p class="section-number">01 / 我的账号</p><h2>登录，然后选择授权</h2></div><span class="small-count">{{ me.accounts.length }} 个</span></div>
-          <div class="platform-tabs" aria-label="选择登录平台"><button type="button" :class="{ selected: platform === 'chaoxing' }" @click="platform = 'chaoxing'">学习通</button><button type="button" :class="{ selected: platform === 'rainClassroom' }" @click="platform = 'rainClassroom'">雨课堂</button></div>
+          <div class="panel-heading"><div><p class="section-number">01 / 我的账号</p><h2>登录后自动参与签到</h2></div><span class="small-count">{{ me.accounts.length }} 个</span></div>
+          <div class="platform-tabs" aria-label="选择登录平台"><button type="button" :class="{ selected: platform === 'rainClassroom' }" @click="platform = 'rainClassroom'">雨课堂</button><button type="button" :class="{ selected: platform === 'chaoxing' }" @click="platform = 'chaoxing'">学习通</button></div>
           <div class="login-controls"><label v-if="platform === 'rainClassroom'" class="server-picker">服务器<select v-model="server"><option v-for="(name, key) in serverNames" :key="key" :value="key">{{ name }}</option></select></label><button class="button secondary" type="button" :disabled="!!busy" @click="startLogin">{{ busy === 'login' ? '正在获取二维码…' : `扫码登录${label(platform, platform === 'chaoxing' ? '' : server)}` }} <span aria-hidden="true">↗</span></button></div>
           <div v-if="!me.accounts.length" class="empty-accounts"><span class="empty-symbol" aria-hidden="true">＋</span><h3>先登录你的第一个账号</h3><p>账号验证成功后，会出现在这里。</p></div>
-          <ul v-else class="account-list"><li v-for="account in me.accounts" :key="account.id"><div class="account-top"><span class="avatar" aria-hidden="true">{{ account.name.slice(0, 1) }}</span><div class="account-name"><b>{{ account.name }}</b><span>{{ label(account.platform, account.server) }}</span></div><span :class="['badge', account.valid ? 'valid' : 'warning']">{{ account.valid ? '已登录' : '需重新登录' }}</span></div><div class="account-bottom"><label class="authorization"><input type="checkbox" :checked="!!account.authorized" :disabled="(!account.valid && !account.authorized) || pendingAccounts.has(account.id)" @change="toggleAuthorization(account, $event)" /><span>{{ account.authorized ? '已授权参与批量签到' : '允许参与批量签到' }}</span></label><button class="text-button danger" type="button" :disabled="pendingAccounts.has(account.id)" @click="unbind(account)">解绑</button></div></li></ul>
-          <div class="authorization-note"><span aria-hidden="true">↳</span><p>授权后，本网站其他已登录成员可以为你发起签到。关闭网页或退出网站仍可参与；关闭授权可停止新的请求。</p></div>
+          <ul v-else class="account-list"><li v-for="account in me.accounts" :key="account.id"><div class="account-top"><span class="avatar" aria-hidden="true">{{ account.name.slice(0, 1) }}</span><div class="account-name"><b>{{ account.name }}</b><span>{{ label(account.platform, account.server) }}</span></div><span :class="['badge', account.valid ? 'valid' : 'warning']">{{ account.valid ? '已加入签到池' : '需重新登录' }}</span></div><div class="account-bottom"><button class="text-button danger" type="button" :disabled="pendingAccounts.has(account.id)" @click="unbind(account)">解绑</button></div></li></ul>
+          <div class="account-note"><span aria-hidden="true">↳</span><p>登录成功后自动加入共享签到池；退出网站不影响有效登录态。解绑会删除登录态并停止后续签到。</p></div>
         </section>
 
         <div class="right-column">
-          <section class="panel scan-panel"><div class="panel-heading"><div><p class="section-number">02 / 发起签到</p><h2>一张二维码，一起签到</h2></div><span class="scan-glyph" aria-hidden="true">⌗</span></div><p class="muted">自动识别两平台的签到码，为对应平台与服务器的授权账号发起签到。</p><div class="scan-actions"><button class="button primary" type="button" :disabled="!!busy || cameraStarting" @click="startCamera">{{ cameraStarting ? '正在打开摄像头…' : '打开摄像头扫码' }}</button><button class="button ghost" type="button" :disabled="!!busy" @click="fileInput?.click()">{{ busy === 'image' ? '正在识别…' : '上传二维码图片' }}</button><input ref="fileInput" class="sr-only" type="file" accept="image/*" aria-label="上传二维码图片" @change="decodeFile" /></div><div v-if="cameraVisible" class="camera-panel"><video ref="video" autoplay muted playsinline aria-label="二维码摄像头预览"></video><div class="camera-target" aria-hidden="true"></div><button class="button camera-close" type="button" @click="stopCamera">关闭摄像头</button></div><form class="link-form" @submit.prevent="submitQr()"><label for="qr-link">或粘贴签到二维码链接</label><textarea id="qr-link" v-model="qrText" rows="2" maxlength="8192" placeholder="https://…" required></textarea><button class="button submit-link" type="submit" :disabled="!!busy || !qrText.trim()">{{ busy === 'sign' ? '正在发起…' : '发起批量签到 →' }}</button></form></section>
+          <section class="panel scan-panel"><div class="panel-heading"><div><p class="section-number">02 / 发起签到</p><h2>一张二维码，一起签到</h2></div><span class="scan-glyph" aria-hidden="true">⌗</span></div><p class="muted">自动识别两平台的签到码，为对应平台与服务器的有效登录账号发起签到。</p><div class="scan-actions"><button class="button primary" type="button" :disabled="!!busy || cameraStarting" @click="startCamera">{{ cameraStarting ? '正在打开摄像头…' : '打开摄像头扫码' }}</button><button class="button ghost" type="button" :disabled="!!busy" @click="fileInput?.click()">{{ busy === 'image' ? '正在识别…' : '上传二维码图片' }}</button><input ref="fileInput" class="sr-only" type="file" accept="image/*" aria-label="上传二维码图片" @change="decodeFile" /></div><div v-if="cameraVisible" class="camera-panel"><video ref="video" autoplay muted playsinline aria-label="二维码摄像头预览"></video><div class="camera-target" aria-hidden="true"></div><button class="button camera-close" type="button" @click="stopCamera">关闭摄像头</button></div><form class="link-form" @submit.prevent="submitQr()"><label for="qr-link">或粘贴签到二维码链接</label><textarea id="qr-link" v-model="qrText" rows="2" maxlength="8192" placeholder="https://…" required></textarea><button class="button submit-link" type="submit" :disabled="!!busy || !qrText.trim()">{{ busy === 'sign' ? '正在发起…' : '发起批量签到 →' }}</button></form></section>
 
-          <section class="panel result-panel"><div class="panel-heading"><div><p class="section-number">03 / 签到结果</p><h2>每个人，都有结果</h2></div><span v-if="currentJob" :class="['badge', currentJob.status === 'done' ? 'valid' : 'warning']">{{ currentJob.status === 'running' ? '执行中' : currentJob.status === 'needs_action' ? '待补验' : '已处理' }}</span></div><label v-if="me.jobs.length" class="job-picker">签到记录<select v-model="selectedJob" @change="selectJob(selectedJob)"><option v-for="job in me.jobs" :key="job.id" :value="job.id">{{ timeLabel(job.created_at) }} · {{ label(job.platform, job.server) }}{{ job.is_initiator ? ' · 我发起的' : ' · 我的结果' }}</option></select></label><div v-if="!currentJob" class="empty-results"><span aria-hidden="true">—</span><p>第一次扫码之后，结果会出现在这里。</p></div><template v-else><div class="result-summary"><span><strong>{{ successCount }}</strong> / {{ currentJob.results.length }} 已签到</span><span v-if="actionCount" class="action-count">{{ actionCount }} 个待补验</span><span v-else class="muted">{{ timeLabel(currentJob.created_at) }}</span></div><div class="progress-track" role="progressbar" :aria-valuenow="progress" aria-valuemin="0" aria-valuemax="100" aria-label="账号处理进度"><span :style="{ width: `${progress}%` }"></span></div><p v-if="streamHint" class="fine-print" role="status">{{ streamHint }}</p><ul class="result-list"><li v-for="result in currentJob.results" :key="result.account_id"><div class="result-main"><b>{{ result.name }}</b><span :class="['result-status', { good: ['success', 'already_signed'].includes(result.status), caution: result.status.startsWith('needs_') || result.status === 'unknown' }]"><span v-if="result.status === 'running'" class="spinner small"></span>{{ statusNames[result.status] ?? '待确认' }}</span></div><p>{{ result.message }}</p><div v-if="result.status === 'needs_captcha' || (currentJob.platform === 'chaoxing' && ['needs_official_verification', 'unknown', 'failed', 'qr_expired'].includes(result.status))" class="result-actions"><button v-if="result.status === 'needs_captcha'" class="text-button" type="button" :disabled="captchaBusy" @click="loadCaptcha(result)">完成滑块验证 ↗</button><button v-if="currentJob.platform === 'chaoxing'" class="text-button" type="button" :disabled="pendingAccounts.has(result.account_id)" @click="refreshReceipt(result)">刷新官方回执</button></div></li></ul><p v-if="currentJob.platform === 'rainClassroom' && currentJob.results.some(r => r.status === 'unknown')" class="fine-print">雨课堂未确认的结果请在官方 App 核实，网站不会自动重复提交。</p></template></section>
+          <section class="panel result-panel"><div class="panel-heading"><div><p class="section-number">03 / 签到结果</p><h2>每个人，都有结果</h2></div><span v-if="currentJob" :class="['badge', currentJob.status === 'done' ? 'valid' : 'warning']">{{ currentJob.status === 'running' ? '执行中' : currentJob.status === 'needs_action' ? '待补验' : '已处理' }}</span></div><label v-if="me.jobs.length" class="job-picker">签到记录<select v-model="selectedJob" @change="selectJob(selectedJob)"><option v-for="job in me.jobs" :key="job.id" :value="job.id">{{ timeLabel(job.created_at) }} · {{ label(job.platform, job.server) }}{{ job.is_initiator ? ' · 我发起的' : ' · 我的结果' }}</option></select></label><div v-if="!currentJob" class="empty-results"><span aria-hidden="true">—</span><p>第一次扫码之后，结果会出现在这里。</p></div><template v-else><div class="result-summary"><span><strong>{{ successCount }}</strong> / {{ currentJob.summary.total }} 个账号已签到</span><span v-if="actionCount" class="action-count">{{ actionCount }} 个待补验</span><span v-else class="muted">{{ timeLabel(currentJob.created_at) }}</span></div><div class="progress-track" role="progressbar" :aria-valuenow="progress" aria-valuemin="0" aria-valuemax="100" aria-label="账号处理进度"><span :style="{ width: `${progress}%` }"></span></div><p v-if="streamHint" class="fine-print" role="status">{{ streamHint }}</p><ul class="result-list"><li v-for="result in currentJob.results" :key="result.account_id"><div class="result-main"><b>{{ result.name }}</b><span :class="['result-status', { good: ['success', 'already_signed'].includes(result.status), caution: result.status.startsWith('needs_') || result.status === 'unknown' }]"><span v-if="result.status === 'running'" class="spinner small"></span>{{ statusNames[result.status] ?? '待确认' }}</span></div><p>{{ result.message }}</p><div v-if="result.can_act && (result.status === 'needs_captcha' || (currentJob.platform === 'chaoxing' && ['needs_official_verification', 'unknown', 'failed', 'qr_expired'].includes(result.status)))" class="result-actions"><button v-if="result.status === 'needs_captcha'" class="text-button" type="button" :disabled="captchaBusy" @click="loadCaptcha(result)">完成滑块验证 ↗</button><button v-if="currentJob.platform === 'chaoxing'" class="text-button" type="button" :disabled="pendingAccounts.has(result.account_id)" @click="refreshReceipt(result)">刷新官方回执</button></div></li></ul><p v-if="currentJob.platform === 'rainClassroom' && currentJob.results.some(r => r.status === 'unknown')" class="fine-print">雨课堂未确认的结果请在官方 App 核实，网站不会自动重复提交。</p></template></section>
         </div>
       </div>
     </main>
 
-    <footer class="footer"><span>课程助手</span><span>一人扫码 · 按授权执行 · 随时撤销</span></footer>
+    <footer class="footer"><span>课程助手</span><span>一人扫码 · 登录自动参与 · 解绑可退出</span></footer>
     <dialog ref="loginDialog" class="modal login-modal" @cancel.prevent="closeLogin"><button class="modal-close" type="button" aria-label="关闭登录二维码" @click="closeLogin">×</button><template v-if="activeLogin"><p class="eyebrow">{{ label(activeLogin.platform, activeLogin.server) }}</p><h2>用官方 App 扫码登录</h2><p class="muted">打开{{ activeLogin.platform === 'chaoxing' ? '学习通' : '雨课堂' }}，扫描二维码并确认授权。</p><div class="login-qr"><img v-if="activeLogin.status === 'waiting' && loginImage" :src="loginImage" alt="请用对应官方 App 扫描的登录二维码" /><div v-else class="qr-expired"><span aria-hidden="true">↻</span><p>{{ activeLogin.message || '二维码已失效' }}</p></div></div><p class="login-status" role="status">{{ activeLogin.message || '正在等待官方 App 确认…' }}</p><button class="button secondary full" type="button" :disabled="!!busy" @click="startLogin">重新生成二维码</button><p class="fine-print">官方 App 支持相册识别时，可以保存二维码后在相册中选择。</p></template></dialog>
     <dialog ref="captchaDialog" class="modal captcha-modal" @cancel="challenge = null"><button class="modal-close" type="button" aria-label="关闭滑块验证" :disabled="captchaBusy" @click="captchaDialog?.close(); challenge = null">×</button><CaptchaPanel v-if="challenge && captchaTarget" :challenge="challenge" :name="captchaTarget.name" :busy="captchaBusy" @verify="verifyCaptcha" @refresh="loadCaptcha()" /></dialog>
   </div>
